@@ -306,9 +306,8 @@ export async function readProfileWithFallback(
   const dashboardUrl = getDashboardUrl()
   if (dashboardUrl) {
     try {
-      const token = getDashboardToken()
-      const headers: Record<string, string> = {}
-      if (token) headers['Authorization'] = `Bearer ${token}`
+      const auth = await dashboardAuthHeaders()
+      const headers: Record<string, string> = { ...auth }
 
       const response = await fetch(`${dashboardUrl}/api/profiles`, {
         headers,

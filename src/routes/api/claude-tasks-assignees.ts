@@ -7,7 +7,7 @@
  */
 import { createFileRoute } from '@tanstack/react-router'
 import { isAuthenticated } from '../../server/auth-middleware'
-import { BEARER_TOKEN, CLAUDE_API, CLAUDE_DASHBOARD_URL } from '../../server/gateway-capabilities'
+import { BEARER_TOKEN, CLAUDE_API, CLAUDE_DASHBOARD_URL, dashboardAuthHeaders } from '../../server/gateway-capabilities'
 import fs from 'node:fs'
 import path from 'node:path'
 import os from 'node:os'
@@ -106,9 +106,12 @@ function normalizeAssigneePayload(payload: unknown, humanReviewer: string | null
 
 async function fetchJson(url: string): Promise<unknown | null> {
   try {
+    // Use dashboard auth headers for dashboard URLs, gateway bearer for others.
+    const isDashboard = url.includes(CLAUDE_DASHBOARD_URL)
+    const headers = isDashboard ? await dashboardAuthHeaders() : authHeaders()
     const res = await fetch(url, {
       signal: AbortSignal.timeout(2000),
-      headers: authHeaders(),
+      headers,
     })
     if (!res.ok) return null
     return await res.json()
