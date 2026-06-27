@@ -3,6 +3,8 @@ import os from 'node:os'
 import path from 'node:path'
 import YAML from 'yaml'
 
+import { dashboardAuthHeaders } from './gateway-capabilities'
+
 export type ProfileSummary = {
   name: string
   path: string
@@ -198,15 +200,6 @@ function getDashboardUrl(): string | undefined {
   return url || undefined
 }
 
-function getDashboardToken(): string | undefined {
-  return (
-    process.env.HERMES_API_TOKEN?.trim() ||
-    process.env.CLAUDE_API_TOKEN?.trim() ||
-    process.env.CLAUDE_DASHBOARD_TOKEN?.trim() ||
-    undefined
-  )
-}
-
 async function fetchDashboardProfiles(): Promise<{
   profiles: Array<ProfileSummary>
   activeProfile: string
@@ -215,9 +208,8 @@ async function fetchDashboardProfiles(): Promise<{
   if (!dashboardUrl) return null
 
   try {
-    const token = getDashboardToken()
-    const headers: Record<string, string> = {}
-    if (token) headers['Authorization'] = `Bearer ${token}`
+    const auth = await dashboardAuthHeaders()
+    const headers: Record<string, string> = { ...auth }
 
     const response = await fetch(`${dashboardUrl}/api/profiles`, {
       headers,
