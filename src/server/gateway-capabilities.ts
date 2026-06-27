@@ -331,8 +331,14 @@ async function fetchDashboardCookies(options?: {
   }
 }
 
-/** Optional bearer token for authenticated gateway endpoints. */
-export const BEARER_TOKEN = process.env.HERMES_API_TOKEN || process.env.CLAUDE_API_TOKEN || ''
+/** Optional bearer token for authenticated gateway endpoints.
+ *  Mutable so profile switches can update the token without restarting. */
+export let BEARER_TOKEN = process.env.HERMES_API_TOKEN || process.env.CLAUDE_API_TOKEN || ''
+
+/** Update the bearer token at runtime (used by profile switching). */
+export function setBearerToken(token: string): void {
+  BEARER_TOKEN = token
+}
 
 /**
  * Dashboard API auth uses the ephemeral session token injected into the

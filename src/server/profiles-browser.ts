@@ -3,7 +3,7 @@ import os from 'node:os'
 import path from 'node:path'
 import YAML from 'yaml'
 
-import { dashboardAuthHeaders } from './gateway-capabilities'
+import { dashboardAuthHeaders, setGatewayUrl, setBearerToken } from './gateway-capabilities'
 
 export type ProfileSummary = {
   name: string
@@ -72,6 +72,40 @@ function getActiveProfilePath(): string {
 
 function stickyActiveProfileEnabled(): boolean {
   return process.env.HERMES_WORKSPACE_STICKY_PROFILE !== '0'
+}
+
+/**
+ * Read the gateway API port and token for a profile from its .env file
+ * (API_SERVER_PORT + API_SERVER_KEY). No need for HERMES_API_TOKEN_PORT_*
+ * in the workspace .env — the profile's own .env has everything.
+ */
+function readProfileGateway(profileName: string): {
+  port: string
+  token: string
+} {
+  const defaultPort = '8642'
+  const defaultToken =
+    process.env.HERMES_API_TOKEN || process.env.CLAUDE_API_TOKEN || ''
+  if (profileName === 'default') {
+    return { port: defaultPort, token: defaultToken }
+  }
+  const envPath = path.join(getProfilesRoot(), profileName, '.env')
+  let port = defaultPort
+  let token = defaultToken
+  if (fs.existsSync(envPath)) {
+    const content = fs.readFileSync(envPath, 'utf8')
+    for (const line of content.split('\n')) {
+      const trimmed = line.trim()
+      if (!trimmed || trimmed.startsWith('#')) continue
+      const eqIdx = trimmed.indexOf('=')
+      if (eqIdx === -1) continue
+      const key = trimmed.slice(0, eqIdx).trim()
+      const value = trimmed.slice(eqIdx + 1).trim()
+      if (key === 'API_SERVER_PORT') port = value
+      if (key === 'API_SERVER_KEY') token = value
+    }
+  }
+  return { port, token }
 }
 
 /**
@@ -233,8 +267,10 @@ async function fetchDashboardProfiles(): Promise<{
 
     if (!data.profiles || !Array.isArray(data.profiles)) return null
 
-    const activeProfile =
-      data.profiles.find((p) => p.is_default)?.name || 'default'
+    // The dashboard API doesn't report which profile is active — it only
+    // flags is_default. Read the active_profile file from disk to determine
+    // the real active profile so the UI reflects profile switches.
+    const activeProfile = getActiveProfileName()
 
     const profiles: Array<ProfileSummary> = data.profiles.map((p) => ({
       name: p.name,
@@ -523,6 +559,12 @@ export function setActiveProfile(name: string): void {
       const activePath = getActiveProfilePath()
       if (fs.existsSync(activePath)) fs.unlinkSync(activePath)
     }
+    const gw = readProfileGateway('default')
+    setGatewayUrl(`http://127.0.0.1:${gw.port}`)
+    setBearerToken(gw.token)
+    console.warn(
+      `[profiles] Active profile set to "default". Gateway → :${gw.port}.`,
+    )
     return
   }
   const normalized = validateProfileName(trimmed)
@@ -532,8 +574,14 @@ export function setActiveProfile(name: string): void {
     fs.mkdirSync(getClaudeRoot(), { recursive: true })
     fs.writeFileSync(getActiveProfilePath(), `${normalized}\n`, 'utf-8')
   }
+  // Re-route the workspace to this profile's gateway port + token.
+  // Each profile runs its own gateway on a dedicated port (API_SERVER_PORT)
+  // with its own token (HERMES_API_TOKEN_PORT_<port> or API_SERVER_KEY).
+  const gw = readProfileGateway(normalized)
+  setGatewayUrl(`http://127.0.0.1:${gw.port}`)
+  setBearerToken(gw.token)
   console.warn(
-    `[profiles] Active profile set to "${normalized}". Restart the Hermes Agent gateway for this profile switch to take effect.`,
+    `[profiles] Active profile set to "${normalized}". Gateway → :${gw.port}, token updated.`,
   )
 }
 
