@@ -1,7 +1,7 @@
 import { URL, fileURLToPath } from 'node:url'
 import { execSync, spawn } from 'node:child_process'
 import type { ChildProcess } from 'node:child_process'
-import { copyFileSync, existsSync, mkdirSync } from 'node:fs'
+import { copyFileSync, existsSync, mkdirSync, readFileSync } from 'node:fs'
 import net from 'node:net'
 import { resolve, dirname } from 'node:path'
 import os from 'node:os'
@@ -88,6 +88,35 @@ async function isClaudeAgentHealthy(port = 8642): Promise<boolean> {
 
 const config = defineConfig(({ mode, command }) => {
   const env = loadEnv(mode, process.cwd(), '')
+  // Raw .env parse without process.env contamination. Vite's loadEnv()
+  // merges shell env vars into its return object, so a shell-exported
+  // PORT (e.g. VSCode EnvironmentVariableCollection injecting PORT=3022)
+  // would override the .env value. We read .env directly to get the
+  // workspace-local source of truth for PORT resolution.
+  const envRaw = (() => {
+    const raw: Record<string, string> = {}
+    const dotenvPath = resolve(process.cwd(), '.env')
+    if (existsSync(dotenvPath)) {
+      const content = readFileSync(dotenvPath, 'utf8')
+      for (const line of content.split('\n')) {
+        const trimmed = line.trim()
+        if (!trimmed || trimmed.startsWith('#')) continue
+        const eqIdx = trimmed.indexOf('=')
+        if (eqIdx === -1) continue
+        const key = trimmed.slice(0, eqIdx).trim()
+        let value = trimmed.slice(eqIdx + 1).trim()
+        // Strip surrounding quotes
+        if (
+          (value.startsWith('"') && value.endsWith('"')) ||
+          (value.startsWith("'") && value.endsWith("'"))
+        ) {
+          value = value.slice(1, -1)
+        }
+        if (key) raw[key] = value
+      }
+    }
+    return raw
+  })()
   // Bridge loadEnv into process.env for server-side SSR runtime code that
   // reads env vars directly from process.env (e.g. getBearerToken() in
   // openai-compat-api.ts reads process.env.HERMES_API_TOKEN). Without this,
@@ -497,9 +526,20 @@ const config = defineConfig(({ mode, command }) => {
       host: '0.0.0.0',
       // Port precedence:
       //   1. --port CLI flag (wins, but we no longer hardcode it in package.json)
-      //   2. $PORT env var (for containers, reverse proxies, WhatsApp bridge collisions, etc. — see #96)
-      //   3. default 3000 (matches README/docs/docker-compose expectations)
-      port: process.env.PORT ? Number(process.env.PORT) : 3000,
+      //   2. PORT from .env file (workspace-local source of truth — see #96)
+      //   3. $PORT shell env var (containers, reverse proxies, WhatsApp bridge, etc.)
+      //   4. default 3000 (matches README/docs/docker-compose expectations)
+      //
+      // NOTE: Vite's loadEnv() merges process.env into its return object, so
+      // env.PORT is contaminated by whatever the shell has (e.g. VSCode's
+      // EnvironmentVariableCollection injecting PORT=3022). We parse .env
+      // directly to get the workspace-local value without shell contamination.
+      port: (() => {
+        const dotenvPort = envRaw.PORT
+        if (dotenvPort) return Number(dotenvPort)
+        if (process.env.PORT) return Number(process.env.PORT)
+        return 3000
+      })(),
       // Managed Workspace launchers expect a stable port. Fail loudly instead
       // of silently hopping to 3001+ so launchctl/service health matches the
       // actual listening socket.
