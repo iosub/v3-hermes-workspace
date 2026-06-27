@@ -258,6 +258,79 @@ let lastLoggedSummary = ''
 let dashboardTokenPromise: Promise<string> | null = null
 let dashboardTokenCache = ''
 
+// ── Cookie-based dashboard auth ───────────────────────────────────
+// When the dashboard has basic_auth enabled, it uses cookie-based session
+// auth (POST /auth/password-login → hermes_session_at / hermes_session_rt
+// cookies). The legacy HTML-scrape token approach doesn't work because the
+// dashboard doesn't embed a bearer token in its HTML — it redirects to
+// /login instead. We login with credentials from HERMES_DASHBOARD_BASIC_AUTH_*
+// and cache the resulting cookies.
+let dashboardCookiePromise: Promise<string> | null = null
+let dashboardCookieCache = ''
+
+/** Basic-auth credentials for the dashboard (from env or ~/.hermes/.env). */
+function getDashboardBasicAuthCreds(): { username: string; password: string } | null {
+  const username = process.env.HERMES_DASHBOARD_BASIC_AUTH_USERNAME?.trim()
+  const password = process.env.HERMES_DASHBOARD_BASIC_AUTH_PASSWORD?.trim()
+  if (username && password) return { username, password }
+  return null
+}
+
+/** Parse Set-Cookie headers from a Response into a cookie string. */
+function extractCookies(res: Response): string {
+  const cookies: string[] = []
+  const setCookies = res.headers.getSetCookie?.() ?? []
+  for (const sc of setCookies) {
+    const pair = sc.split(';')[0]
+    if (pair && pair.includes('=')) cookies.push(pair.trim())
+  }
+  return cookies.join('; ')
+}
+
+/**
+ * Login to the dashboard via /auth/password-login and cache the session
+ * cookies. Returns a cookie string suitable for the Cookie header.
+ */
+async function fetchDashboardCookies(options?: {
+  force?: boolean
+}): Promise<string> {
+  const force = options?.force === true
+  if (!force && dashboardCookieCache) return dashboardCookieCache
+  if (!force && dashboardCookiePromise) return dashboardCookiePromise
+
+  const creds = getDashboardBasicAuthCreds()
+  if (!creds) return ''
+
+  dashboardCookiePromise = (async () => {
+    const res = await fetch(`${CLAUDE_DASHBOARD_URL}/auth/password-login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        provider: 'basic',
+        username: creds.username,
+        password: creds.password,
+        next: '/',
+      }),
+      signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
+    })
+    if (!res.ok) {
+      throw new Error(`Dashboard login failed: ${res.status}`)
+    }
+    const cookieStr = extractCookies(res)
+    if (!cookieStr) {
+      throw new Error('Dashboard login succeeded but no cookies returned')
+    }
+    dashboardCookieCache = cookieStr
+    return cookieStr
+  })()
+
+  try {
+    return await dashboardCookiePromise
+  } finally {
+    dashboardCookiePromise = null
+  }
+}
+
 /** Optional bearer token for authenticated gateway endpoints. */
 export const BEARER_TOKEN = process.env.HERMES_API_TOKEN || process.env.CLAUDE_API_TOKEN || ''
 
@@ -287,9 +360,25 @@ export async function fetchDashboardToken(options?: {
   dashboardTokenPromise = (async () => {
     // Dashboard injects the session token inline on `/` (root), not on
     // `/index.html` which serves the raw Vite-built HTML without the token.
+    // When basic_auth is enabled, we need to send the session cookies or
+    // the root will 302-redirect to /login and the scrape will fail.
+    const headers: Record<string, string> = {}
+    const creds = getDashboardBasicAuthCreds()
+    if (creds) {
+      const cookie = await fetchDashboardCookies(options)
+      if (cookie) headers['Cookie'] = cookie
+    }
     const res = await fetch(`${CLAUDE_DASHBOARD_URL}/`, {
+      headers,
+      redirect: 'manual',
       signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
     })
+    // 200 = token is in the HTML. 302 = dashboard wants auth and we don't
+    // have cookies (or they're stale). Don't follow the redirect — it goes
+    // to /login which has no token.
+    if (res.status === 302) {
+      throw new Error('Dashboard root redirected to login (auth required)')
+    }
     if (!res.ok) {
       throw new Error(`Dashboard index failed: ${res.status}`)
     }
@@ -318,8 +407,22 @@ export async function getDashboardToken(options?: {
 export async function dashboardAuthHeaders(options?: {
   force?: boolean
 }): Promise<Record<string, string>> {
+  // Prefer cookie-based auth when basic_auth credentials are configured —
+  // the dashboard uses cookie sessions, not bearer tokens.
+  const creds = getDashboardBasicAuthCreds()
+  if (creds) {
+    const cookie = await fetchDashboardCookies(options)
+    return cookie ? { Cookie: cookie } : {}
+  }
+  // Fall back to the legacy HTML-scrape bearer token approach.
   const token = await getDashboardToken(options)
   return token ? { Authorization: `Bearer ${token}` } : {}
+}
+
+/** Clear cached dashboard auth (cookies + bearer token) so the next call re-auths. */
+export function clearDashboardAuthCache(): void {
+  dashboardCookieCache = ''
+  dashboardTokenCache = ''
 }
 
 function withDashboardBase(path: string): string {
@@ -361,7 +464,9 @@ export async function dashboardFetch(
 
   let res = await doFetch(false)
   if (res.status === 401) {
+    // Clear both caches so the retry re-logs-in / re-scrapes from scratch.
     dashboardTokenCache = ''
+    dashboardCookieCache = ''
     res = await doFetch(true)
   }
   return res

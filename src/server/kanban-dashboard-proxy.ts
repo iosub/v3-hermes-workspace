@@ -26,7 +26,8 @@
  */
 import {
   CLAUDE_DASHBOARD_URL,
-  fetchDashboardToken,
+  dashboardAuthHeaders,
+  clearDashboardAuthCache,
 } from './gateway-capabilities'
 
 const PROXY_TIMEOUT_MS = 10_000
@@ -54,20 +55,21 @@ export type DashboardKanbanBoardResponse = {
 }
 
 /**
- * Build headers for dashboard kanban API calls. The plugin route is
- * unauthenticated by design (loopback only), but we still pass the
- * dashboard session token if we have one — some setups proxy the
- * dashboard behind auth that requires it.
+ * Build headers for dashboard kanban API calls. Uses dashboardAuthHeaders
+ * which handles both cookie-based auth (basic_auth login) and the legacy
+ * bearer-token HTML scrape fallback.
  */
 async function buildHeaders(): Promise<Record<string, string>> {
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
   }
   try {
-    const token = await fetchDashboardToken()
-    if (token) headers.Authorization = `Bearer ${token}`
+    const auth = await dashboardAuthHeaders()
+    for (const [key, value] of Object.entries(auth)) {
+      headers[key] = value
+    }
   } catch {
-    // Token fetch is best-effort. The plugin route works without it
+    // Auth is best-effort. The plugin route works without it
     // on standard loopback installs.
   }
   return headers
@@ -87,12 +89,28 @@ async function dashboardFetch<T>(
   init: RequestInit = {},
   params: Record<string, string | undefined> = {},
 ): Promise<T> {
-  const headers = await buildHeaders()
-  const res = await fetch(dashboardUrl(path, params), {
-    ...init,
-    headers: { ...headers, ...(init.headers || {}) },
-    signal: AbortSignal.timeout(PROXY_TIMEOUT_MS),
-  })
+  const doFetch = async (forceAuth = false) => {
+    const headers = await buildHeaders()
+    if (forceAuth) {
+      // On 401 retry, clear cache and re-auth from scratch.
+      clearDashboardAuthCache()
+      const fresh = await dashboardAuthHeaders({ force: true })
+      for (const [key, value] of Object.entries(fresh)) {
+        headers[key] = value
+      }
+    }
+    const res = await fetch(dashboardUrl(path, params), {
+      ...init,
+      headers: { ...headers, ...(init.headers || {}) },
+      signal: AbortSignal.timeout(PROXY_TIMEOUT_MS),
+    })
+    return res
+  }
+
+  let res = await doFetch(false)
+  if (res.status === 401) {
+    res = await doFetch(true)
+  }
   if (!res.ok) {
     const body = await res.text().catch(() => '')
     throw new Error(
